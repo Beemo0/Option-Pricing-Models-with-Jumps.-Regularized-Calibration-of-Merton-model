@@ -243,33 +243,39 @@ def levenberg_marquardt(
     """
     Algorithme de Levenberg-Marquardt générique pour un problème de la forme :
 
-        min_θ  (1/N)‖F(θ)‖² + R(θ)
+        min_θ  L(θ) := (1/N)‖F(θ)‖² + R(θ)
 
-    où R(θ) représente le terme de régularisation (Tikhonov ou entropie),
-    déjà incorporé dans F_func/J_func sous forme augmentée (Tikhonov) ou via
-    gradient/Hessienne (entropie).
+    Interface unifiée — deux modes supportés, choisis automatiquement selon
+    ce que retourne `F_func(theta)` :
 
-    F_func(theta) → (F_tilde, J_tilde) pour Tikhonov (résidu augmenté)
-    F_func(theta) → (grad_total, H_approx) pour entropie (gradient + Hessien GN)
-
-    En pratique, on utilise l'interface unifiée :
-
+    Mode "résidu" (utilisé par Tikhonov) :
         F_func(theta) → (res_vec, jac_mat)
+    avec res_vec ∈ R^(N+k) le résidu augmenté tel que ‖res_vec‖² = L(θ)
+    EXACTEMENT (propriété indispensable : c'est cette même quantité qui sert
+    au calcul du ratio de gain ρ_k). jac_mat ∈ R^((N+k)×2).
 
-    où :
-      - res_vec ∈ R^(N+k) est le vecteur résidu augmenté (Tikhonov) ou un
-        vecteur artificiel tel que ‖res_vec‖² = L(θ)
-      - jac_mat ∈ R^((N+k)×2) est la jacobienne correspondante
+    Mode "scalaire" (utilisé par l'entropie relative) :
+        F_func(theta) → (L_val, grad, hess)
+    avec L_val = L(θ) (float), grad = ∇L(θ) ∈ R², hess ≈ ∇²L(θ) ∈ R^(2×2)
+    (approximation Gauss-Newton + terme analytique pour la partie
+    régularisation). Ce mode évite toute reconstruction artificielle d'un
+    pseudo-résidu : le ratio de gain est calculé directement sur L(θ), qui
+    est la quantité réellement minimisée — c'est ce qui garantit que LM
+    converge vers le bon minimum.
 
-    La mise à jour LM est :
-        (J^T J + μ I) Δθ = −J^T F
+    Dans les deux cas, la mise à jour est du type Levenberg-Marquardt :
+        (J^T J + μ I) Δθ = −J^T F         [mode résidu]
+        (H + μ I) Δθ = −grad              [mode scalaire]
 
     Parameters
     ----------
-    F_func  : Callable  theta → (res, jac).
+    F_func  : Callable  theta → (res, jac)  ou  theta → (L, grad, hess).
     J_func  : None      (inutilisé, inclus pour compatibilité).
     theta0  : ndarray (2,)  Point initial (λ₀, δ₀).
-    N_data  : int       Nombre d'options (pour le calcul du RMSE).
+    N_data  : int       Nombre d'options (pour le calcul du RMSE). Utilisé
+                        uniquement en mode résidu (RMSE = ‖F[:N_data]‖/√N_data).
+                        En mode scalaire, le RMSE est recalculé par l'appelant
+                        à partir du résidu réel (cf. calibrate_entropy).
     mu0     : float     Amortissement initial.
     nu      : float     Facteur d'adaptation de μ.
     rho_min : float     Seuil d'acceptation du pas (ρ_min ∈ (0,1)).
@@ -286,8 +292,23 @@ def levenberg_marquardt(
     theta = np.clip(theta0.astype(float), bounds[0], bounds[1])
     mu = float(mu0)
 
-    F, J = F_func(theta)
-    L = float(np.dot(F, F))
+    out0 = F_func(theta)
+    scalar_mode = len(out0) == 3
+
+    def _eval(th):
+        """Retourne (L, grad, hess, F_for_rmse_or_None) de façon homogène."""
+        out = F_func(th)
+        if scalar_mode:
+            L_val, grad, hess = out
+            return float(L_val), np.asarray(grad, dtype=float), np.asarray(hess, dtype=float), None
+        else:
+            F, J = out
+            L_val = float(np.dot(F, F))
+            grad = J.T @ F          # (2,)
+            hess = J.T @ J          # (2,2) approx Gauss-Newton
+            return L_val, grad, hess, F
+
+    L, grad, hess, F = _eval(theta)
 
     hist_L     = [L]
     hist_theta = [theta.copy()]
@@ -298,10 +319,8 @@ def levenberg_marquardt(
 
     for k in range(k_max):
         n_iter = k + 1
-        JTF = J.T @ F          # (2,)
-        JTJ = J.T @ J          # (2,2)
 
-        grad_inf = float(np.max(np.abs(JTF)))
+        grad_inf = float(np.max(np.abs(grad)))
 
         # ── Critère 1 : gradient faible ───────────────────────────────────
         if grad_inf <= eps1:
@@ -309,8 +328,8 @@ def levenberg_marquardt(
             break
 
         # ── Résolution du système normal modifié ──────────────────────────
-        A = JTJ + mu * np.eye(2)
-        dtheta = _lm_solve(A, -JTF)
+        A = hess + mu * np.eye(2)
+        dtheta = _lm_solve(A, -grad)
 
         # ── Critère 2 : pas relatif faible ────────────────────────────────
         step_rel = float(np.linalg.norm(dtheta) /
@@ -321,29 +340,26 @@ def levenberg_marquardt(
 
         # ── Évaluation du ratio de gain ───────────────────────────────────
         theta_new = np.clip(theta + dtheta, bounds[0], bounds[1])
-        F_new, J_new = F_func(theta_new)
-        L_new = float(np.dot(F_new, F_new))
+        L_new, grad_new, hess_new, F_new = _eval(theta_new)
 
-        # Prédiction linéaire : ‖F + J·Δθ‖²
-        F_pred = F + J @ dtheta
-        L_pred = float(np.dot(F_pred, F_pred))
-        denom  = L - L_pred
+        # Prédiction de la réduction par le modèle quadratique local :
+        #   L(θ+Δθ) ≈ L(θ) + grad·Δθ + 0.5*Δθ^T·hess·Δθ
+        pred_reduction = -(np.dot(grad, dtheta) + 0.5 * dtheta @ hess @ dtheta)
+        actual_reduction = L - L_new
 
-        rho = (L - L_new) / (denom + 1e-300) if abs(denom) > 1e-300 else 0.0
+        rho = actual_reduction / pred_reduction if abs(pred_reduction) > 1e-300 else 0.0
 
         # ── Critère 3 : variation de L faible ─────────────────────────────
         if abs(L - L_new) / (L + eps3) <= eps3 and rho > 0:
             theta = theta_new
-            F, J  = F_new, J_new
-            L     = L_new
+            L, grad, hess, F = L_new, grad_new, hess_new, F_new
             converged = True
             break
 
         # ── Mise à jour θ et μ ────────────────────────────────────────────
         if rho > rho_min:
             theta = theta_new
-            F, J  = F_new, J_new
-            L     = L_new
+            L, grad, hess, F = L_new, grad_new, hess_new, F_new
             mu    = max(mu / nu, 1e-16)
         else:
             mu = min(mu * nu, 1e10)
@@ -352,8 +368,13 @@ def levenberg_marquardt(
         hist_theta.append(theta.copy())
         hist_mu.append(mu)
 
-    # RMSE sur les N_data premières composantes
-    RMSE = float(np.sqrt(np.dot(F[:N_data], F[:N_data]) / N_data))
+    # RMSE : en mode résidu, calculable directement depuis F.
+    # En mode scalaire, F vaut None ici — l'appelant (calibrate_entropy)
+    # recalcule le RMSE à partir du vrai résidu des données.
+    if F is not None:
+        RMSE = float(np.sqrt(np.dot(F[:N_data], F[:N_data]) / N_data))
+    else:
+        RMSE = float('nan')
 
     return {
         'theta'     : theta,
@@ -519,47 +540,54 @@ def calibrate_entropy(
     dict  Résultat + 'all_starts'.
     """
     N = len(sigma_mkt)
-    sqrt_N = np.sqrt(N)
 
     kw_res = dict(sigma_mkt=sigma_mkt, strikes=strikes, maturities=maturities,
                   S0=S0, r=r, sigma0=sigma0, muJ0=muJ0, n_terms=n_terms)
 
-    def F_aug(theta):
+    def L_grad_hess(theta):
+        """
+        Mode scalaire pour LM : retourne (L(θ), ∇L(θ), ∇²L(θ) approché).
+
+            L(θ) = (1/N)‖F(θ)‖² + β · H(Q(θ)|Q₀)/T
+
+        Le gradient et la Hessienne de L sont la somme exacte :
+          - terme data, approché par Gauss-Newton (standard pour les
+            moindres carrés) :
+                ∇_data L  = (2/N) J^T F
+                ∇²_data L ≈ (2/N) J^T J
+          - terme entropie, calculé ANALYTIQUEMENT via entropy_grad /
+            entropy_hess (pas de différences finies, pas d'approximation) :
+                ∇_ent L  = β · g_H
+                ∇²_ent L = β · H_H
+
+        Contrairement à l'ancienne implémentation, on ne construit ici
+        aucun résidu artificiel : L_val est la vraie valeur de la fonction
+        objectif, ce qui garantit que le ratio de gain ρ_k de LM est
+        calculé correctement et que l'algorithme converge bien vers le
+        minimiseur de L_β.
+        """
         lam, delta = float(theta[0]), float(theta[1])
         F = compute_residuals(lam, delta, **kw_res)
         J = compute_jacobian(lam, delta, **kw_res)
 
-        # Termes data (normalisés par N)
-        JTJ_data = J.T @ J / N   # (2,2)
-        JTF_data = J.T @ F / N   # (2,)
+        L_data = float(np.dot(F, F)) / N
+        grad_data = (2.0 / N) * (J.T @ F)      # (2,)
+        hess_data = (2.0 / N) * (J.T @ J)      # (2,2) Gauss-Newton
 
-        # Termes entropie (analytiques)
-        g_H   = entropy_grad(lam, delta, lam0, delta0) if beta > 0 else np.zeros(2)
-        H_H   = entropy_hess(lam, delta, lam0, delta0) if beta > 0 else np.zeros((2, 2))
-        H_ent = entropy_KL(lam, delta, lam0, delta0)   if beta > 0 else 0.0
+        if beta > 0:
+            H_ent = entropy_KL(lam, delta, lam0, delta0)
+            g_H   = entropy_grad(lam, delta, lam0, delta0)
+            H_H   = entropy_hess(lam, delta, lam0, delta0)
+        else:
+            H_ent = 0.0
+            g_H   = np.zeros(2)
+            H_H   = np.zeros((2, 2))
 
-        # Hessienne totale approx (Gauss-Newton data + exacte entropie)
-        JTJ_total = JTJ_data + beta * H_H  # (2,2)
+        L_val = L_data + beta * H_ent
+        grad  = grad_data + beta * g_H
+        hess  = hess_data + beta * H_H
 
-        # Construction d'un résidu et jacobienne artificiels tels que :
-        #   J_art^T J_art = JTJ_total
-        #   J_art^T F_art = JTF_data + beta * g_H
-        # On utilise la factorisation de Cholesky de JTJ_total.
-        try:
-            L_chol = np.linalg.cholesky(JTJ_total + 1e-12 * np.eye(2))
-        except np.linalg.LinAlgError:
-            L_chol = np.eye(2) * 1e-6
-
-        # F_art = L_chol^{-T} (JTF_data + beta * g_H)
-        rhs = JTF_data + beta * g_H
-        F_art = np.linalg.solve(L_chol.T, rhs)      # (2,)
-        J_art = L_chol.T                              # (2,2)
-
-        # L(θ) = (1/N)‖F‖² + β H/T
-        L_val = np.dot(F, F) / N + beta * H_ent
-
-        # Retourner un vecteur cohérent : ‖F_art‖² ≈ L(θ), J_art^T F_art = gradient/2
-        return F_art, J_art
+        return L_val, grad, hess
 
     rng = np.random.default_rng(seed)
     starts = np.column_stack([
@@ -573,10 +601,11 @@ def calibrate_entropy(
 
     for s in starts:
         res = levenberg_marquardt(
-            F_aug, None, s, N,
+            L_grad_hess, None, s, N,
             **lm_kwargs
         )
-        # Recalculer L et RMSE avec la vraie fonction objectif
+        # Recalculer L et RMSE avec la vraie fonction objectif (cohérence
+        # numérique avec le point final retenu par LM).
         lam_s, delta_s = res['lambda_'], res['delta']
         F_true = compute_residuals(lam_s, delta_s, **kw_res)
         H_val  = entropy_KL(lam_s, delta_s, lam0, delta0) if beta > 0 else 0.0
